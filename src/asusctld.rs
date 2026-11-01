@@ -5,17 +5,42 @@
 mod asus_hw;
 
 use asus_hw::*;
+use std::env;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::Path;
+use std::panic;
+use std::process::{self, Command};
 use std::thread;
 use std::time::{Duration, Instant};
 
+fn install_daemon_crash_revert_hook() {
+    panic::set_hook(Box::new(|panic_info| {
+        eprintln!(
+            "[asusctld] CRITICAL: Daemon panic detected ({}). Reverting to previous driver/hardware state...",
+            panic_info
+        );
+        match revert_to_backup_state() {
+            Ok(restored) => {
+                eprintln!(
+                    "[asusctld] Automatic crash rollback completed: {}",
+                    restored.join(", ")
+                );
+            }
+            Err(e) => {
+                eprintln!("[asusctld] Rollback error during crash handler: {}", e);
+            }
+        }
+    }));
+}
+
 fn restore_persisted_state() {
-    let _ = fs::create_dir_all(CONFIG_DIR);
-    if !Path::new(KEYMAP_FILE).exists() {
+    let _ = fs::create_dir_all(config_dir());
+    // Capture a pre-change backup snapshot if one does not already exist
+    let _ = capture_backup_state(false);
+
+    if !keymap_file().exists() {
         let _ = save_key_bindings(&default_key_bindings());
     }
     let st = AsusState::load();
@@ -40,7 +65,62 @@ fn restore_persisted_state() {
     }
 }
 
+fn spawn_confirmation_watchdog() {
+    let needs_confirm = pending_confirm_file().exists() || !is_driver_confirmed();
+    if !needs_confirm {
+        return;
+    }
+
+    let timeout_secs = env::var("ASUSCTL_CONFIRM_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(90)
+        .max(1);
+
+    eprintln!(
+        "[asusctld] Confirmation required within {}s (run 'asusctl confirm' to keep new driver settings, otherwise automatic rollback will trigger).",
+        timeout_secs
+    );
+
+    thread::spawn(move || {
+        let start = Instant::now();
+        let total = Duration::from_secs(timeout_secs);
+        while start.elapsed() < total {
+            thread::sleep(Duration::from_millis(250));
+            if is_driver_confirmed() && !pending_confirm_file().exists() {
+                eprintln!("[asusctld] Driver configuration confirmed by user; watchdog disarmed.");
+                return;
+            }
+        }
+
+        if is_driver_confirmed() && !pending_confirm_file().exists() {
+            return;
+        }
+
+        eprintln!(
+            "[asusctld] WARNING: User confirmation timeout ({}s) expired without 'asusctl confirm'. Automatically reverting to previous driver/hardware state...",
+            timeout_secs
+        );
+        match revert_to_backup_state() {
+            Ok(restored) => {
+                eprintln!(
+                    "[asusctld] Auto-revert completed: {}",
+                    restored.join(", ")
+                );
+            }
+            Err(e) => {
+                eprintln!("[asusctld] Auto-revert encountered error: {}", e);
+            }
+        }
+        let _ = fs::remove_file(socket_path());
+        process::exit(0);
+    });
+}
+
 fn spawn_wmi_hotkey_listener() {
+    if is_sandbox() {
+        return;
+    }
     thread::spawn(|| {
         let mut last_button = String::new();
         let mut last_press = Instant::now() - Duration::from_secs(10);
@@ -69,7 +149,10 @@ fn spawn_wmi_hotkey_listener() {
             let mut buf = [0u8; 24];
             loop {
                 if file.read_exact(&mut buf).is_err() {
-                    eprintln!("[asusctld] Input device {} disconnected, re-opening...", ev_path.display());
+                    eprintln!(
+                        "[asusctld] Input device {} disconnected, re-opening...",
+                        ev_path.display()
+                    );
                     thread::sleep(Duration::from_secs(2));
                     break;
                 }
@@ -156,6 +239,24 @@ fn process_command(cmd: &str) -> Result<String, String> {
 
     match verb.as_str() {
         "STATUS" => Ok(format_status_report()),
+        "CONFIRM" => {
+            confirm_driver_state()?;
+            Ok("debian_asusctl driver configuration confirmed and locked in.".to_string())
+        }
+        "REVERT" => {
+            let restored = revert_to_backup_state()?;
+            Ok(format!(
+                "Reverted to previous driver/hardware state ({})",
+                restored.join(", ")
+            ))
+        }
+        "BACKUP" => {
+            capture_backup_state(true)?;
+            Ok(format!(
+                "Saved current hardware/driver state snapshot to {}",
+                backup_file().display()
+            ))
+        }
         "PROFILE_SET" => {
             let prof = PowerProfile::from_str(arg1).ok_or_else(|| {
                 format!(
@@ -205,11 +306,17 @@ fn process_command(cmd: &str) -> Result<String, String> {
         "KEYS_RESET" => {
             let defs = default_key_bindings();
             save_key_bindings(&defs)?;
-            Ok(format!("Restored default ASUS button bindings in {}", KEYMAP_FILE))
+            Ok(format!(
+                "Restored default ASUS button bindings in {}",
+                keymap_file().display()
+            ))
         }
         "KEYS_BIND" => {
             if arg1.is_empty() || arg2.is_empty() {
                 return Err("Usage: KEYS_BIND <button> <action>".to_string());
+            }
+            if !is_valid_action(arg2) {
+                return Err(format!("Invalid or unsafe action '{}'", arg2));
             }
             let mut bindings = load_key_bindings();
             let found = bindings
@@ -237,20 +344,27 @@ fn process_command(cmd: &str) -> Result<String, String> {
 }
 
 fn main() {
+    install_daemon_crash_revert_hook();
     eprintln!(
         "Starting debian_asusctl daemon (asusctld v{})...",
         VERSION
     );
     restore_persisted_state();
+    spawn_confirmation_watchdog();
     spawn_wmi_hotkey_listener();
 
-    let _ = fs::remove_file(SOCKET_PATH);
-    let listener = match UnixListener::bind(SOCKET_PATH) {
+    let sock = socket_path();
+    if let Some(parent) = sock.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::remove_file(&sock);
+    let listener = match UnixListener::bind(&sock) {
         Ok(l) => l,
         Err(e) => {
             eprintln!(
                 "[asusctld] Warning: could not bind {} ({}). Running in hotkey-only mode.",
-                SOCKET_PATH, e
+                sock.display(),
+                e
             );
             loop {
                 thread::sleep(Duration::from_secs(3600));
@@ -258,9 +372,14 @@ fn main() {
         }
     };
 
-    // Allow desktop users to communicate with asusctld over /run/asusctl.sock without sudo
-    let _ = fs::set_permissions(SOCKET_PATH, fs::Permissions::from_mode(0o666));
-    eprintln!("[asusctld] Ready and listening on {}", SOCKET_PATH);
+    // Restrict socket to root:sudo (mode 0660) for security
+    let _ = fs::set_permissions(&sock, fs::Permissions::from_mode(0o660));
+    if !is_sandbox() {
+        let _ = Command::new("chgrp")
+            .args(["sudo", &sock.to_string_lossy()])
+            .status();
+    }
+    eprintln!("[asusctld] Ready and listening on {}", sock.display());
 
     for stream in listener.incoming().flatten() {
         thread::spawn(move || handle_client(stream));

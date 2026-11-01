@@ -1,17 +1,80 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-// debian_asusctl — Core Hardware, Power Profile, Fan, LED, ScreenPad, Battery & Keymap Engine
-// Supports Debian / Kali GNU/Linux on ASUS ZenBook Pro Duo (UX582LR), ZenBook, VivoBook, TUF & ROG laptops.
+// debian_asusctl — Core Hardware, Power Profile, Fan, LED, ScreenPad, Battery, Keymap & Rollback Engine
 
 use std::collections::BTreeMap;
+use std::env;
 use std::fs;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-pub const VERSION: &str = "6.2.0-debian2";
-pub const CONFIG_DIR: &str = "/etc/asusctl";
-pub const STATE_FILE: &str = "/etc/asusctl/asusctl.conf";
-pub const KEYMAP_FILE: &str = "/etc/asusctl/keymap.conf";
-pub const SOCKET_PATH: &str = "/run/asusctl.sock";
+pub const VERSION: &str = "6.2.0-debian3";
+pub const DEFAULT_CONFIRM_TIMEOUT_SECS: u64 = 90;
+
+pub fn is_sandbox() -> bool {
+    env::var("ASUSCTL_SANDBOX_DIR").is_ok()
+}
+
+pub fn root_prefix() -> PathBuf {
+    if let Ok(sb) = env::var("ASUSCTL_SANDBOX_DIR") {
+        let p = PathBuf::from(sb.trim());
+        if p.is_absolute() && p.exists() {
+            return p;
+        }
+    }
+    PathBuf::from("/")
+}
+
+pub fn sys_path(rel: &str) -> PathBuf {
+    let clean = rel.trim_start_matches('/');
+    root_prefix().join(clean)
+}
+
+pub fn user_fallback_config_dir() -> PathBuf {
+    if let Ok(home) = env::var("HOME") {
+        PathBuf::from(home).join(".config/asusctl")
+    } else {
+        PathBuf::from("/tmp/asusctl")
+    }
+}
+
+pub fn config_dir() -> PathBuf {
+    sys_path("/etc/asusctl")
+}
+
+pub fn state_file() -> PathBuf {
+    let primary = sys_path("/etc/asusctl/asusctl.conf");
+    if !is_sandbox() {
+        let user_sf = user_fallback_config_dir().join("asusctl.conf");
+        if user_sf.exists() && fs::OpenOptions::new().write(true).open(&primary).is_err() {
+            return user_sf;
+        }
+    }
+    primary
+}
+
+pub fn backup_file() -> PathBuf {
+    let primary = sys_path("/etc/asusctl/backup_state.conf");
+    if !is_sandbox() {
+        let user_bf = user_fallback_config_dir().join("backup_state.conf");
+        if !primary.exists() && user_bf.exists() {
+            return user_bf;
+        }
+    }
+    primary
+}
+
+pub fn keymap_file() -> PathBuf {
+    sys_path("/etc/asusctl/keymap.conf")
+}
+
+pub fn socket_path() -> PathBuf {
+    sys_path("/run/asusctl.sock")
+}
+
+pub fn pending_confirm_file() -> PathBuf {
+    sys_path("/run/asusctl.pending_confirm")
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PowerProfile {
@@ -67,13 +130,37 @@ pub fn read_trimmed(path: impl AsRef<Path>) -> Option<String> {
 
 pub fn write_sysfs(path: impl AsRef<Path>, val: &str) -> Result<(), String> {
     let p = path.as_ref();
-    fs::write(p, format!("{}\n", val.trim()))
-        .or_else(|_| fs::write(p, val.trim().as_bytes()))
+    let clean = val.trim();
+    if clean.contains('\0') || clean.contains('\n') {
+        return Err("Invalid control characters in sysfs value".to_string());
+    }
+    fs::write(p, format!("{}\n", clean))
+        .or_else(|_| fs::write(p, clean.as_bytes()))
         .map_err(|e| format!("{}: {}", p.display(), e))
 }
 
+pub fn is_secure_config_file(path: &Path) -> bool {
+    if let Ok(meta) = fs::metadata(path) {
+        let mode = meta.mode();
+        if (mode & 0o002) != 0 {
+            return false;
+        }
+        if is_sandbox() {
+            return true;
+        }
+        return meta.uid() == 0;
+    }
+    false
+}
+
+pub fn sanitize_text(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_control() && *c != '\'' && *c != '"' && *c != '`' && *c != '$' && *c != '\\')
+        .collect()
+}
+
 pub fn find_asus_hwmon_dir() -> Option<PathBuf> {
-    let base = Path::new("/sys/devices/platform/asus-nb-wmi/hwmon");
+    let base = sys_path("/sys/devices/platform/asus-nb-wmi/hwmon");
     if let Ok(entries) = fs::read_dir(base) {
         for entry in entries.flatten() {
             let p = entry.path();
@@ -82,7 +169,7 @@ pub fn find_asus_hwmon_dir() -> Option<PathBuf> {
             }
         }
     }
-    if let Ok(entries) = fs::read_dir("/sys/class/hwmon") {
+    if let Ok(entries) = fs::read_dir(sys_path("/sys/class/hwmon")) {
         for entry in entries.flatten() {
             let p = entry.path();
             if let Some(name) = read_trimmed(p.join("name")) {
@@ -97,7 +184,7 @@ pub fn find_asus_hwmon_dir() -> Option<PathBuf> {
 
 pub fn find_battery_threshold_path() -> Option<PathBuf> {
     for bat in ["BAT0", "BAT1", "BATT", "BATC"] {
-        let p = PathBuf::from(format!(
+        let p = sys_path(&format!(
             "/sys/class/power_supply/{}/charge_control_end_threshold",
             bat
         ));
@@ -113,12 +200,12 @@ pub fn find_kbd_backlight_dir() -> Option<PathBuf> {
         "/sys/class/leds/asus::kbd_backlight",
         "/sys/devices/platform/asus-nb-wmi/leds/asus::kbd_backlight",
     ] {
-        let p = PathBuf::from(cand);
+        let p = sys_path(cand);
         if p.exists() {
             return Some(p);
         }
     }
-    if let Ok(entries) = fs::read_dir("/sys/class/leds") {
+    if let Ok(entries) = fs::read_dir(sys_path("/sys/class/leds")) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
             if name.contains("kbd_backlight") {
@@ -134,7 +221,7 @@ pub fn find_screenpad_dir() -> Option<PathBuf> {
         "/sys/class/backlight/asus_screenpad",
         "/sys/devices/platform/asus-nb-wmi/backlight/asus_screenpad",
     ] {
-        let p = PathBuf::from(cand);
+        let p = sys_path(cand);
         if p.exists() {
             return Some(p);
         }
@@ -143,14 +230,14 @@ pub fn find_screenpad_dir() -> Option<PathBuf> {
 }
 
 pub fn find_asus_wmi_input_event() -> Option<PathBuf> {
-    let by_path = PathBuf::from("/dev/input/by-path/platform-asus-nb-wmi-event");
+    let by_path = sys_path("/dev/input/by-path/platform-asus-nb-wmi-event");
     if by_path.exists() {
         if let Ok(canon) = fs::canonicalize(&by_path) {
             return Some(canon);
         }
         return Some(by_path);
     }
-    if let Ok(content) = fs::read_to_string("/proc/bus/input/devices") {
+    if let Ok(content) = fs::read_to_string(sys_path("/proc/bus/input/devices")) {
         let mut is_asus_wmi = false;
         for line in content.lines() {
             if line.starts_with("N: Name=") {
@@ -160,7 +247,7 @@ pub fn find_asus_wmi_input_event() -> Option<PathBuf> {
             } else if is_asus_wmi && line.starts_with("H: Handlers=") {
                 for tok in line.split_whitespace() {
                     if tok.starts_with("event") {
-                        let ev_path = PathBuf::from(format!("/dev/input/{}", tok));
+                        let ev_path = sys_path(&format!("/dev/input/{}", tok));
                         if ev_path.exists() {
                             return Some(ev_path);
                         }
@@ -181,6 +268,7 @@ pub struct AsusState {
     pub screenpad_enabled: bool,
     pub screenpad_brightness: u8,
     pub fnlock_enabled: bool,
+    pub confirmed: bool,
 }
 
 impl Default for AsusState {
@@ -192,6 +280,7 @@ impl Default for AsusState {
             screenpad_enabled: true,
             screenpad_brightness: 180,
             fnlock_enabled: true,
+            confirmed: true,
         }
     }
 }
@@ -199,7 +288,6 @@ impl Default for AsusState {
 impl AsusState {
     pub fn load() -> Self {
         let mut st = Self::default();
-        // Seed from live hardware first
         st.profile = detect_current_profile();
         if let Some(lim) = get_battery_limit() {
             st.charge_limit = lim;
@@ -217,7 +305,8 @@ impl AsusState {
             st.fnlock_enabled = fnl;
         }
 
-        if let Ok(raw) = fs::read_to_string(STATE_FILE) {
+        let sf = state_file();
+        if let Ok(raw) = fs::read_to_string(&sf) {
             for line in raw.lines() {
                 let ln = line.trim();
                 if ln.is_empty() || ln.starts_with('#') {
@@ -253,6 +342,9 @@ impl AsusState {
                         "fnlock_enabled" => {
                             st.fnlock_enabled = matches!(val, "true" | "1" | "yes" | "on" | "Y");
                         }
+                        "confirmed" => {
+                            st.confirmed = matches!(val, "true" | "1" | "yes" | "on" | "Y");
+                        }
                         _ => {}
                     }
                 }
@@ -262,7 +354,9 @@ impl AsusState {
     }
 
     pub fn save(&self) -> Result<(), String> {
-        let _ = fs::create_dir_all(CONFIG_DIR);
+        let dir = config_dir();
+        let _ = fs::create_dir_all(&dir);
+        let sf = state_file();
         let body = format!(
             "# /etc/asusctl/asusctl.conf — Persisted ASUS Hardware & Power State (debian_asusctl)\n\
              profile={}\n\
@@ -270,16 +364,259 @@ impl AsusState {
              kbd_brightness={}\n\
              screenpad_enabled={}\n\
              screenpad_brightness={}\n\
-             fnlock_enabled={}\n",
+             fnlock_enabled={}\n\
+             confirmed={}\n",
             self.profile.as_str(),
             self.charge_limit,
             self.kbd_brightness,
             self.screenpad_enabled,
             self.screenpad_brightness,
-            self.fnlock_enabled
+            self.fnlock_enabled,
+            self.confirmed
         );
-        fs::write(STATE_FILE, body).map_err(|e| format!("Failed writing {}: {}", STATE_FILE, e))
+        if fs::write(&sf, &body).is_ok() {
+            return Ok(());
+        }
+        if !is_sandbox() {
+            let udir = user_fallback_config_dir();
+            let _ = fs::create_dir_all(&udir);
+            let usf = udir.join("asusctl.conf");
+            return fs::write(&usf, body)
+                .map_err(|e| format!("Failed writing {}: {}", usf.display(), e));
+        }
+        Err(format!("Failed writing {}", sf.display()))
     }
+}
+
+/// Captures a complete snapshot of current kernel/driver sysfs settings so the system
+/// can automatically revert if unconfirmed or if a daemon crash occurs.
+pub fn capture_backup_state(overwrite: bool) -> Result<PathBuf, String> {
+    let bf = backup_file();
+    if bf.exists() && !overwrite {
+        return Ok(bf);
+    }
+    let _ = fs::create_dir_all(config_dir());
+
+    let cpufv = read_trimmed(sys_path("/sys/devices/platform/asus-nb-wmi/cpufv")).unwrap_or_else(|| "0".to_string());
+    let ttp = read_trimmed(sys_path("/sys/devices/platform/asus-nb-wmi/throttle_thermal_policy")).unwrap_or_default();
+    let acpi_pp = read_trimmed(sys_path("/sys/firmware/acpi/platform_profile")).unwrap_or_default();
+    let pwm1 = find_asus_hwmon_dir()
+        .and_then(|d| read_trimmed(d.join("pwm1_enable")))
+        .unwrap_or_else(|| "2".to_string());
+    let no_turbo = read_trimmed(sys_path("/sys/devices/system/cpu/intel_pstate/no_turbo")).unwrap_or_else(|| "0".to_string());
+    let dyn_boost = read_trimmed(sys_path("/sys/devices/system/cpu/intel_pstate/hwp_dynamic_boost")).unwrap_or_else(|| "1".to_string());
+    let min_perf = read_trimmed(sys_path("/sys/devices/system/cpu/intel_pstate/min_perf_pct")).unwrap_or_else(|| "15".to_string());
+    let max_perf = read_trimmed(sys_path("/sys/devices/system/cpu/intel_pstate/max_perf_pct")).unwrap_or_else(|| "100".to_string());
+    let gov = read_trimmed(sys_path("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor")).unwrap_or_else(|| "powersave".to_string());
+    let epp = read_trimmed(sys_path("/sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference")).unwrap_or_else(|| "balance_performance".to_string());
+    let pl1 = read_trimmed(sys_path("/sys/class/powercap/intel-rapl:0/constraint_0_power_limit_uw")).unwrap_or_else(|| "45000000".to_string());
+    let pl2 = read_trimmed(sys_path("/sys/class/powercap/intel-rapl:0/constraint_1_power_limit_uw")).unwrap_or_else(|| "90000000".to_string());
+    let (sp_en, sp_br, _) = get_screenpad_status().unwrap_or((true, 180, 255));
+    let (main_br, _) = get_main_display_brightness().unwrap_or((264, 528));
+    let (kbd_br, _) = get_kbd_backlight().unwrap_or((2, 3));
+    let bat_lim = get_battery_limit().unwrap_or(100);
+    let fnlock = get_fnlock().unwrap_or(true);
+
+    let content = format!(
+        "# /etc/asusctl/backup_state.conf — Pre-Install / Last-Known-Good System Driver State\n\
+         cpufv={}\n\
+         throttle_thermal_policy={}\n\
+         acpi_platform_profile={}\n\
+         pwm1_enable={}\n\
+         no_turbo={}\n\
+         hwp_dynamic_boost={}\n\
+         min_perf_pct={}\n\
+         max_perf_pct={}\n\
+         scaling_governor={}\n\
+         energy_performance_preference={}\n\
+         rapl_pl1_uw={}\n\
+         rapl_pl2_uw={}\n\
+         screenpad_bl_power={}\n\
+         screenpad_brightness={}\n\
+         intel_backlight={}\n\
+         kbd_brightness={}\n\
+         charge_limit={}\n\
+         fnlock={}\n",
+        cpufv,
+        ttp,
+        acpi_pp,
+        pwm1,
+        no_turbo,
+        dyn_boost,
+        min_perf,
+        max_perf,
+        gov,
+        epp,
+        pl1,
+        pl2,
+        if sp_en { 1 } else { 0 },
+        sp_br.max(120),
+        main_br,
+        kbd_br,
+        bat_lim,
+        if fnlock { "Y" } else { "N" }
+    );
+    if fs::write(&bf, &content).is_ok() {
+        return Ok(bf);
+    }
+    if !is_sandbox() {
+        let udir = user_fallback_config_dir();
+        let _ = fs::create_dir_all(&udir);
+        let ubf = udir.join("backup_state.conf");
+        fs::write(&ubf, content)
+            .map_err(|e| format!("Failed writing backup {}: {}", ubf.display(), e))?;
+        return Ok(ubf);
+    }
+    Err(format!("Failed writing backup {}", bf.display()))
+}
+
+/// Restores all kernel sysfs driver parameters, ScreenPad Plus power/brightness, primary backlight,
+/// and previous driver binaries (if backed up) when reverting or recovering from a crash/timeout.
+pub fn revert_to_backup_state() -> Result<Vec<String>, String> {
+    let bf = backup_file();
+    let mut kv = BTreeMap::new();
+    if let Ok(raw) = fs::read_to_string(&bf) {
+        for line in raw.lines() {
+            let ln = line.trim();
+            if ln.is_empty() || ln.starts_with('#') {
+                continue;
+            }
+            if let Some((k, v)) = ln.split_once('=') {
+                kv.insert(k.trim().to_string(), v.trim().to_string());
+            }
+        }
+    }
+
+    let mut restored = Vec::new();
+
+    // 1. Always ensure ScreenPad Plus (DP-3) is powered ON and visible so second screen never stays black
+    if let Some(sp_dir) = find_screenpad_dir() {
+        let sp_power = kv.get("screenpad_bl_power").map(|s| s.as_str()).unwrap_or("1");
+        let sp_br = kv.get("screenpad_brightness").map(|s| s.as_str()).unwrap_or("180");
+        let safe_power = if sp_power == "0" { "1" } else { sp_power };
+        let _ = write_sysfs(sp_dir.join("brightness"), sp_br);
+        if write_sysfs(sp_dir.join("bl_power"), safe_power).is_ok() {
+            let _ = write_sysfs(sp_dir.join("brightness"), sp_br);
+            sync_screenpad_xrandr(true);
+            restored.push(format!("screenpad(bl_power={}, brightness={})", safe_power, sp_br));
+        }
+    }
+
+    // 2. Restore primary display backlight (intel_backlight)
+    if let Some(ibr) = kv.get("intel_backlight") {
+        let ib_path = sys_path("/sys/class/backlight/intel_backlight/brightness");
+        if ib_path.exists() {
+            if write_sysfs(&ib_path, ibr).is_ok() {
+                restored.push(format!("intel_backlight={}", ibr));
+            } else if let Ok(v) = ibr.parse::<u32>() {
+                restore_main_display_brightness(v);
+                restored.push(format!("intel_backlight={}", v));
+            }
+        }
+    }
+
+    // 3. Restore ASUS WMI / ATK thermal & fan policy to safe automatic kernel defaults
+    let cpufv_p = sys_path("/sys/devices/platform/asus-nb-wmi/cpufv");
+    if cpufv_p.exists() {
+        let v = kv.get("cpufv").map(|s| s.as_str()).unwrap_or("0");
+        if write_sysfs(&cpufv_p, v).is_ok() {
+            restored.push(format!("cpufv={}", v));
+        }
+    }
+    if let Some(hwmon) = find_asus_hwmon_dir() {
+        let pwm1 = hwmon.join("pwm1_enable");
+        if pwm1.exists() {
+            let v = kv.get("pwm1_enable").map(|s| s.as_str()).unwrap_or("2");
+            if write_sysfs(&pwm1, v).is_ok() {
+                restored.push(format!("pwm1_enable={}", v));
+            }
+        }
+    }
+
+    // 4. Restore Intel P-State & CPUFreq governors
+    let pstate = sys_path("/sys/devices/system/cpu/intel_pstate");
+    if pstate.exists() {
+        let nt = kv.get("no_turbo").map(|s| s.as_str()).unwrap_or("0");
+        let db = kv.get("hwp_dynamic_boost").map(|s| s.as_str()).unwrap_or("1");
+        let minp = kv.get("min_perf_pct").map(|s| s.as_str()).unwrap_or("15");
+        let maxp = kv.get("max_perf_pct").map(|s| s.as_str()).unwrap_or("100");
+        let _ = write_sysfs(pstate.join("no_turbo"), nt);
+        let _ = write_sysfs(pstate.join("hwp_dynamic_boost"), db);
+        let _ = write_sysfs(pstate.join("min_perf_pct"), minp);
+        if write_sysfs(pstate.join("max_perf_pct"), maxp).is_ok() {
+            restored.push(format!("intel_pstate(no_turbo={}, max_perf={}%)", nt, maxp));
+        }
+    }
+
+    let gov = kv.get("scaling_governor").map(|s| s.as_str()).unwrap_or("powersave");
+    let epp = kv.get("energy_performance_preference").map(|s| s.as_str()).unwrap_or("balance_performance");
+    if let Ok(entries) = fs::read_dir(sys_path("/sys/devices/system/cpu")) {
+        let mut cnt = 0usize;
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("cpu") && name[3..].chars().all(|c| c.is_ascii_digit()) && !name[3..].is_empty() {
+                let cpufreq = entry.path().join("cpufreq");
+                if cpufreq.exists() {
+                    let _ = write_sysfs(cpufreq.join("scaling_governor"), gov);
+                    if write_sysfs(cpufreq.join("energy_performance_preference"), epp).is_ok() {
+                        cnt += 1;
+                    }
+                }
+            }
+        }
+        if cnt > 0 {
+            restored.push(format!("cpufreq({}/{})", gov, epp));
+        }
+    }
+
+    // 5. Restore RAPL power limits
+    let rapl = sys_path("/sys/class/powercap/intel-rapl:0");
+    if rapl.exists() {
+        let pl1 = kv.get("rapl_pl1_uw").map(|s| s.as_str()).unwrap_or("45000000");
+        let pl2 = kv.get("rapl_pl2_uw").map(|s| s.as_str()).unwrap_or("90000000");
+        let _ = write_sysfs(rapl.join("constraint_0_power_limit_uw"), pl1);
+        let _ = write_sysfs(rapl.join("constraint_1_power_limit_uw"), pl2);
+        restored.push("rapl_power_limits".to_string());
+    }
+
+    // 6. Restore keyboard backlight, battery limit, and fnlock
+    if let Some(kbr) = kv.get("kbd_brightness") {
+        let _ = set_kbd_backlight(kbr);
+    }
+    if let Some(blim) = kv.get("charge_limit").and_then(|s| s.parse::<u8>().ok()) {
+        let _ = set_battery_limit(blim);
+    }
+    if let Some(fnl) = kv.get("fnlock") {
+        let _ = set_fnlock(fnl);
+    }
+
+    // 7. If a previous /usr/bin/asusctl binary was backed up before install, restore it on full package rollback
+    let prev_bin = sys_path("/var/lib/asusctl/previous_driver_backup/asusctl.orig");
+    if prev_bin.exists() {
+        let target_bin = sys_path("/usr/bin/asusctl");
+        if fs::copy(&prev_bin, &target_bin).is_ok() {
+            restored.push("restored_previous_asusctl_binary".to_string());
+        }
+    }
+
+    let _ = fs::remove_file(pending_confirm_file());
+    Ok(restored)
+}
+
+pub fn confirm_driver_state() -> Result<String, String> {
+    let mut st = AsusState::load();
+    st.confirmed = true;
+    st.save()?;
+    let _ = fs::remove_file(pending_confirm_file());
+    let _ = capture_backup_state(true);
+    Ok("Driver state confirmed and saved as permanent configuration.".to_string())
+}
+
+pub fn is_driver_confirmed() -> bool {
+    if pending_confirm_file().exists() {
+        return false;
+    }
+    AsusState::load().confirmed
 }
 
 pub fn detect_current_profile() -> PowerProfile {
@@ -290,29 +627,29 @@ pub fn detect_current_profile() -> PowerProfile {
             }
         }
     }
-    if let Some(pp) = read_trimmed("/sys/firmware/acpi/platform_profile") {
+    if let Some(pp) = read_trimmed(sys_path("/sys/firmware/acpi/platform_profile")) {
         if let Some(p) = PowerProfile::from_str(&pp) {
             return p;
         }
     }
-    if let Some(ttp) = read_trimmed("/sys/devices/platform/asus-nb-wmi/throttle_thermal_policy") {
+    if let Some(ttp) = read_trimmed(sys_path("/sys/devices/platform/asus-nb-wmi/throttle_thermal_policy")) {
         return match ttp.as_str() {
             "2" => PowerProfile::Quiet,
             "1" => PowerProfile::Performance,
             _ => PowerProfile::Balanced,
         };
     }
-    if let Some(no_turbo) = read_trimmed("/sys/devices/system/cpu/intel_pstate/no_turbo") {
+    if let Some(no_turbo) = read_trimmed(sys_path("/sys/devices/system/cpu/intel_pstate/no_turbo")) {
         if no_turbo == "1" {
             return PowerProfile::Quiet;
         }
     }
-    if let Some(gov) = read_trimmed("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor") {
+    if let Some(gov) = read_trimmed(sys_path("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor")) {
         if gov == "performance" {
             return PowerProfile::Performance;
         }
     }
-    if let Some(epp) = read_trimmed("/sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference") {
+    if let Some(epp) = read_trimmed(sys_path("/sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference")) {
         if epp == "power" {
             return PowerProfile::Quiet;
         } else if epp == "performance" {
@@ -323,50 +660,51 @@ pub fn detect_current_profile() -> PowerProfile {
 }
 
 pub fn apply_power_profile(profile: PowerProfile) -> Result<Vec<String>, String> {
+    let _ = capture_backup_state(false);
     let mut actions: Vec<String> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
 
-    // 1. ACPI platform_profile (if supported by kernel/BIOS)
-    let acpi_pp = Path::new("/sys/firmware/acpi/platform_profile");
+    // 1. ACPI platform_profile
+    let acpi_pp = sys_path("/sys/firmware/acpi/platform_profile");
     if acpi_pp.exists() {
         let val = match profile {
             PowerProfile::Quiet => "quiet",
             PowerProfile::Balanced => "balanced",
             PowerProfile::Performance | PowerProfile::FullSpeed => "performance",
         };
-        if write_sysfs(acpi_pp, val).is_ok() {
+        if write_sysfs(&acpi_pp, val).is_ok() {
             actions.push(format!("acpi_platform_profile={}", val));
         }
     }
 
-    // 2. ASUS WMI throttle_thermal_policy (ROG / TUF)
-    let ttp = Path::new("/sys/devices/platform/asus-nb-wmi/throttle_thermal_policy");
+    // 2. ASUS WMI throttle_thermal_policy
+    let ttp = sys_path("/sys/devices/platform/asus-nb-wmi/throttle_thermal_policy");
     if ttp.exists() {
         let val = match profile {
             PowerProfile::Quiet => "2",
             PowerProfile::Balanced => "0",
             PowerProfile::Performance | PowerProfile::FullSpeed => "1",
         };
-        if write_sysfs(ttp, val).is_ok() {
+        if write_sysfs(&ttp, val).is_ok() {
             actions.push(format!("throttle_thermal_policy={}", val));
         }
     }
 
-    // 3. ASUS ATK cpufv (ZenBook Pro Duo UX582LR / ZenBook / VivoBook)
-    let cpufv = Path::new("/sys/devices/platform/asus-nb-wmi/cpufv");
+    // 3. ASUS ATK cpufv
+    let cpufv = sys_path("/sys/devices/platform/asus-nb-wmi/cpufv");
     if cpufv.exists() {
         let val = match profile {
             PowerProfile::Quiet => "2",
             PowerProfile::Balanced => "0",
             PowerProfile::Performance | PowerProfile::FullSpeed => "1",
         };
-        match write_sysfs(cpufv, val) {
+        match write_sysfs(&cpufv, val) {
             Ok(_) => actions.push(format!("asus_nb_wmi.cpufv={}", val)),
             Err(e) => errors.push(e),
         }
     }
 
-    // 4. ASUS hwmon Fan PWM Control (pwm1_enable: 0=FullSpeed Max Fans, 2=Auto Firmware Curve)
+    // 4. ASUS hwmon Fan PWM Control (0=FullSpeed Max Fans, 2=Auto Firmware Curve)
     if let Some(hwmon) = find_asus_hwmon_dir() {
         let pwm1 = hwmon.join("pwm1_enable");
         if pwm1.exists() {
@@ -375,14 +713,18 @@ pub fn apply_power_profile(profile: PowerProfile) -> Result<Vec<String>, String>
                 _ => "2",
             };
             match write_sysfs(&pwm1, pwm_val) {
-                Ok(_) => actions.push(format!("fan_pwm1_enable={} ({})", pwm_val, if pwm_val == "0" { "Max FullSpeed" } else { "Auto Curve" })),
+                Ok(_) => actions.push(format!(
+                    "fan_pwm1_enable={} ({})",
+                    pwm_val,
+                    if pwm_val == "0" { "Max FullSpeed" } else { "Auto Curve" }
+                )),
                 Err(e) => errors.push(e),
             }
         }
     }
 
     // 5. Intel P-State Turbo, Dynamic Boost & Perf Pct
-    let pstate_dir = Path::new("/sys/devices/system/cpu/intel_pstate");
+    let pstate_dir = sys_path("/sys/devices/system/cpu/intel_pstate");
     if pstate_dir.exists() {
         let (no_turbo, dyn_boost, min_pct, max_pct) = match profile {
             PowerProfile::Quiet => ("1", "0", "15", "75"),
@@ -390,7 +732,10 @@ pub fn apply_power_profile(profile: PowerProfile) -> Result<Vec<String>, String>
             PowerProfile::Performance | PowerProfile::FullSpeed => ("0", "1", "25", "100"),
         };
         if write_sysfs(pstate_dir.join("no_turbo"), no_turbo).is_ok() {
-            actions.push(format!("intel_pstate.turbo={}", if no_turbo == "0" { "ON" } else { "OFF" }));
+            actions.push(format!(
+                "intel_pstate.turbo={}",
+                if no_turbo == "0" { "ON" } else { "OFF" }
+            ));
         }
         let _ = write_sysfs(pstate_dir.join("hwp_dynamic_boost"), dyn_boost);
         let _ = write_sysfs(pstate_dir.join("min_perf_pct"), min_pct);
@@ -407,10 +752,13 @@ pub fn apply_power_profile(profile: PowerProfile) -> Result<Vec<String>, String>
     };
     let mut gov_cnt = 0usize;
     let mut epp_cnt = 0usize;
-    if let Ok(entries) = fs::read_dir("/sys/devices/system/cpu") {
+    if let Ok(entries) = fs::read_dir(sys_path("/sys/devices/system/cpu")) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with("cpu") && name[3..].chars().all(|c| c.is_ascii_digit()) && !name[3..].is_empty() {
+            if name.starts_with("cpu")
+                && name[3..].chars().all(|c| c.is_ascii_digit())
+                && !name[3..].is_empty()
+            {
                 let cpufreq = entry.path().join("cpufreq");
                 if cpufreq.exists() {
                     if write_sysfs(cpufreq.join("scaling_governor"), gov).is_ok() {
@@ -430,8 +778,8 @@ pub fn apply_power_profile(profile: PowerProfile) -> Result<Vec<String>, String>
         actions.push(format!("cpu_epp={} ({} cores)", epp, epp_cnt));
     }
 
-    // 7. Intel RAPL Package Power Limits (PL1 long_term & PL2 short_term in microwatts)
-    let rapl_dir = Path::new("/sys/class/powercap/intel-rapl:0");
+    // 7. Intel RAPL Package Power Limits (PL1 & PL2 in microwatts)
+    let rapl_dir = sys_path("/sys/class/powercap/intel-rapl:0");
     if rapl_dir.exists() {
         let (pl1_uw, pl2_uw) = match profile {
             PowerProfile::Quiet => ("28000000", "45000000"),
@@ -518,7 +866,8 @@ pub fn get_kbd_backlight() -> Option<(u8, u8)> {
 }
 
 pub fn set_kbd_backlight(level_str: &str) -> Result<u8, String> {
-    let dir = find_kbd_backlight_dir().ok_or_else(|| "ASUS keyboard backlight LED interface not found".to_string())?;
+    let dir = find_kbd_backlight_dir()
+        .ok_or_else(|| "ASUS keyboard backlight LED interface not found".to_string())?;
     let (cur, max) = get_kbd_backlight().unwrap_or((0, 3));
     let target: u8 = match level_str.trim().to_ascii_lowercase().as_str() {
         "off" | "0" => 0,
@@ -555,17 +904,18 @@ pub fn get_screenpad_status() -> Option<(bool, u8, u8)> {
     let bl_power = read_trimmed(dir.join("bl_power"))
         .and_then(|s| s.parse::<i32>().ok())
         .unwrap_or(1);
-    // On Linux 7.x asus-wmi.ko (update_screenpad_bl_status):
+    // In Linux 7.x asus-wmi.ko (update_screenpad_bl_status):
     //   bl_power == 0 calls DEVS(0x00050031, 0) -> ScreenPad POWER OFF (DP-3 disconnected)
     //   bl_power == 1 calls DEVS(0x00050031, 1) -> ScreenPad POWER ON  (DP-3 connected)
-    // And raw_br may include 0x1ff00 status bits; low 8 bits hold 0..255 brightness.
     let clean_br = (raw_br & 0xff) as u8;
     let enabled = bl_power != 0 && clean_br > 0;
     Some((enabled, clean_br, max_br))
 }
 
 pub fn sync_screenpad_xrandr(enable: bool) {
-    // Synchronize X11 / RandR layout for built-in high-resolution second screen (DP-3: 3840x1100 / 3072x880)
+    if env::var("ASUSCTL_SANDBOX_DIR").is_ok() {
+        return;
+    }
     let script = if enable {
         "sleep 1.2; \
          if ! xrandr --listmonitors 2>/dev/null | grep -q 'DP-3'; then \
@@ -589,7 +939,7 @@ pub fn sync_screenpad_xrandr(enable: bool) {
 }
 
 pub fn get_main_display_brightness() -> Option<(u32, u32)> {
-    let dir = Path::new("/sys/class/backlight/intel_backlight");
+    let dir = sys_path("/sys/class/backlight/intel_backlight");
     if !dir.exists() {
         return None;
     }
@@ -601,6 +951,11 @@ pub fn get_main_display_brightness() -> Option<(u32, u32)> {
 }
 
 pub fn restore_main_display_brightness(saved_br: u32) {
+    if env::var("ASUSCTL_SANDBOX_DIR").is_ok() {
+        let ib = sys_path("/sys/class/backlight/intel_backlight/brightness");
+        let _ = write_sysfs(ib, &saved_br.to_string());
+        return;
+    }
     let script = format!(
         "for delay in 0.1 0.6; do \
             sleep $delay; \
@@ -616,14 +971,21 @@ pub fn restore_main_display_brightness(saved_br: u32) {
 }
 
 pub fn set_screenpad(action: &str, arg: Option<&str>) -> Result<(bool, u8), String> {
-    let dir = find_screenpad_dir().ok_or_else(|| "ASUS ScreenPad backlight (/sys/class/backlight/asus_screenpad) not found".to_string())?;
+    let dir = find_screenpad_dir().ok_or_else(|| {
+        "ASUS ScreenPad backlight (/sys/class/backlight/asus_screenpad) not found".to_string()
+    })?;
     let mut st = AsusState::load();
-    let (cur_en, cur_br, max_br) = get_screenpad_status().unwrap_or((true, st.screenpad_brightness, 255));
+    let (cur_en, cur_br, max_br) =
+        get_screenpad_status().unwrap_or((true, st.screenpad_brightness, 255));
     let saved_main_br = get_main_display_brightness().map(|(c, _)| c);
 
     match action.trim().to_ascii_lowercase().as_str() {
         "on" | "enable" => {
-            let br = if cur_br < 15 { st.screenpad_brightness.max(180) } else { cur_br };
+            let br = if cur_br < 15 {
+                st.screenpad_brightness.max(180)
+            } else {
+                cur_br
+            };
             let _ = write_sysfs(dir.join("brightness"), &br.to_string());
             write_sysfs(dir.join("bl_power"), "1")?;
             write_sysfs(dir.join("brightness"), &br.to_string())?;
@@ -635,7 +997,6 @@ pub fn set_screenpad(action: &str, arg: Option<&str>) -> Result<(bool, u8), Stri
             if cur_br >= 15 {
                 st.screenpad_brightness = cur_br;
             }
-            // In asus-wmi.ko, bl_power=0 turns off ScreenPad power (0x00050031 -> 0)
             write_sysfs(dir.join("bl_power"), "0")?;
             sync_screenpad_xrandr(false);
             st.screenpad_enabled = false;
@@ -704,7 +1065,14 @@ pub fn set_screenpad(action: &str, arg: Option<&str>) -> Result<(bool, u8), Stri
         restore_main_display_brightness(main_br);
     }
     let _ = st.save();
-    Ok((st.screenpad_enabled, if st.screenpad_enabled { st.screenpad_brightness } else { 0 }))
+    Ok((
+        st.screenpad_enabled,
+        if st.screenpad_enabled {
+            st.screenpad_brightness
+        } else {
+            0
+        },
+    ))
 }
 
 pub fn get_battery_limit() -> Option<u8> {
@@ -714,7 +1082,10 @@ pub fn get_battery_limit() -> Option<u8> {
 
 pub fn set_battery_limit(limit: u8) -> Result<u8, String> {
     if !(20..=100).contains(&limit) {
-        return Err(format!("Battery charge limit must be between 20 and 100 (got {})", limit));
+        return Err(format!(
+            "Battery charge limit must be between 20 and 100 (got {})",
+            limit
+        ));
     }
     let p = find_battery_threshold_path()
         .ok_or_else(|| "Battery charge_control_end_threshold sysfs path not found".to_string())?;
@@ -726,13 +1097,13 @@ pub fn set_battery_limit(limit: u8) -> Result<u8, String> {
 }
 
 pub fn get_fnlock() -> Option<bool> {
-    let p = Path::new("/sys/module/asus_wmi/parameters/fnlock_default");
+    let p = sys_path("/sys/module/asus_wmi/parameters/fnlock_default");
     let v = read_trimmed(p)?;
     Some(matches!(v.as_str(), "Y" | "1" | "true"))
 }
 
 pub fn set_fnlock(mode: &str) -> Result<bool, String> {
-    let p = Path::new("/sys/module/asus_wmi/parameters/fnlock_default");
+    let p = sys_path("/sys/module/asus_wmi/parameters/fnlock_default");
     if !p.exists() {
         return Err("/sys/module/asus_wmi/parameters/fnlock_default not found".to_string());
     }
@@ -763,70 +1134,70 @@ pub fn default_key_bindings() -> Vec<KeyBinding> {
     vec![
         KeyBinding {
             button_name: "fan_performance".to_string(),
-            keycodes: vec![203, 482, 470, 169], // KEY_PROG4 (203), KEY_FN_F (482), KEY_FN_F5 (470)
+            keycodes: vec![203, 482, 470, 169],
             scancodes: vec![0x9d, 0xb3, 0x99, 0xae, 0x6c],
             description: "ASUS Fan / Performance Mode Toggle Key (Above Touchpad / Fn+F)".to_string(),
             action: "profile-next".to_string(),
         },
         KeyBinding {
             button_name: "task_swap".to_string(),
-            keycodes: vec![202], // KEY_PROG3 (202)
+            keycodes: vec![202],
             scancodes: vec![0x38, 0xffff01, 0x8a],
             description: "ASUS Task Swap Key (Swap Active Window Between Main OLED & ScreenPad Plus)".to_string(),
             action: "swap-monitors".to_string(),
         },
         KeyBinding {
             button_name: "screenpad_toggle".to_string(),
-            keycodes: vec![431, 149, 183], // KEY_DISPLAYTOGGLE (431), KEY_PROG2 (149), KEY_F13 (183)
-            scancodes: vec![0x6a, 0x2d, 0x37], // 0x6a = UX582LR ScreenPad Plus Toggle WMI Scancode
+            keycodes: vec![431, 149, 183],
+            scancodes: vec![0x6a, 0x2d, 0x37],
             description: "ASUS ScreenPad Plus On/Off Toggle Key (Above Touchpad)".to_string(),
             action: "screenpad-toggle".to_string(),
         },
         KeyBinding {
             button_name: "myasus_hub".to_string(),
-            keycodes: vec![148], // KEY_PROG1 (148)
+            keycodes: vec![148],
             scancodes: vec![0x86, 0x39],
             description: "MyASUS / ProArt / ROG Custom Launcher Key (Fn+F12)".to_string(),
             action: "status-notify".to_string(),
         },
         KeyBinding {
             button_name: "kbd_backlight_up".to_string(),
-            keycodes: vec![230, 185], // KEY_KBDILLUMUP (230), KEY_F15 (185)
+            keycodes: vec![230, 185],
             scancodes: vec![0xc4],
             description: "Keyboard Backlight Brightness Up (Fn+F8)".to_string(),
             action: "kbd-up".to_string(),
         },
         KeyBinding {
             button_name: "kbd_backlight_down".to_string(),
-            keycodes: vec![229, 184], // KEY_KBDILLUMDOWN (229), KEY_F14 (184)
+            keycodes: vec![229, 184],
             scancodes: vec![0xc5],
             description: "Keyboard Backlight Brightness Down (Fn+F7)".to_string(),
             action: "kbd-down".to_string(),
         },
         KeyBinding {
             button_name: "touchpad_toggle".to_string(),
-            keycodes: vec![530, 531], // KEY_TOUCHPAD_TOGGLE (530), KEY_TOUCHPAD_ON (531)
+            keycodes: vec![530, 531],
             scancodes: vec![0x6b],
             description: "ASUS Touchpad Enable/Disable Key (Fn+F6)".to_string(),
             action: "touchpad-toggle".to_string(),
         },
         KeyBinding {
             button_name: "mic_mute".to_string(),
-            keycodes: vec![248], // KEY_MICMUTE (248 — dropped by X11 255 limit without daemon)
+            keycodes: vec![248],
             scancodes: vec![0x7c],
             description: "ASUS Microphone Mute Toggle Key (Fn+F9)".to_string(),
             action: "mic-mute".to_string(),
         },
         KeyBinding {
             button_name: "camera_toggle".to_string(),
-            keycodes: vec![212], // KEY_CAMERA (212)
+            keycodes: vec![212],
             scancodes: vec![0x82, 0x85],
             description: "ASUS Webcam Shield / Camera Toggle Key (Fn+F10)".to_string(),
             action: "camera-notify".to_string(),
         },
         KeyBinding {
             button_name: "selective_screenshot".to_string(),
-            keycodes: vec![634], // KEY_SELECTIVE_SCREENSHOT (634 — dropped by X11 255 limit)
+            keycodes: vec![634],
             scancodes: vec![0x2a, 0x6e],
             description: "ASUS Screen Snipping / Screenshot Key (Fn+F11)".to_string(),
             action: "screenshot".to_string(),
@@ -834,22 +1205,52 @@ pub fn default_key_bindings() -> Vec<KeyBinding> {
     ]
 }
 
+pub fn is_valid_action(act: &str) -> bool {
+    let trimmed = act.trim();
+    if trimmed.is_empty() || trimmed.len() > 256 || trimmed.contains('\n') || trimmed.contains('\0') {
+        return false;
+    }
+    if let Some(cmd) = trimmed.strip_prefix("exec:") {
+        return !cmd.trim().is_empty();
+    }
+    matches!(
+        trimmed.to_ascii_lowercase().as_str(),
+        "profile-next"
+            | "profile-standard"
+            | "swap-monitors"
+            | "screenpad-toggle"
+            | "screenpad-up"
+            | "screenpad-down"
+            | "kbd-up"
+            | "kbd-down"
+            | "touchpad-toggle"
+            | "mic-mute"
+            | "screenshot"
+            | "camera-notify"
+            | "status-notify"
+    )
+}
+
 pub fn load_key_bindings() -> Vec<KeyBinding> {
     let mut bindings = default_key_bindings();
-    if let Ok(raw) = fs::read_to_string(KEYMAP_FILE) {
-        let mut overrides = BTreeMap::new();
-        for line in raw.lines() {
-            let ln = line.trim();
-            if ln.is_empty() || ln.starts_with('#') {
-                continue;
+    let kf = keymap_file();
+    if kf.exists() && is_secure_config_file(&kf) {
+        if let Ok(raw) = fs::read_to_string(&kf) {
+            let mut overrides = BTreeMap::new();
+            for line in raw.lines() {
+                let ln = line.trim();
+                if ln.is_empty() || ln.starts_with('#') {
+                    continue;
+                }
+                if let Some((k, v)) = ln.split_once('=') {
+                    let act = v.trim();
+                    if is_valid_action(act) {
+                        overrides.insert(k.trim().to_ascii_lowercase(), act.to_string());
+                    }
+                }
             }
-            if let Some((k, v)) = ln.split_once('=') {
-                overrides.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
-            }
-        }
-        for b in &mut bindings {
-            if let Some(custom_act) = overrides.get(&b.button_name.to_ascii_lowercase()) {
-                if !custom_act.is_empty() {
+            for b in &mut bindings {
+                if let Some(custom_act) = overrides.get(&b.button_name.to_ascii_lowercase()) {
                     b.action = custom_act.clone();
                 }
             }
@@ -859,38 +1260,34 @@ pub fn load_key_bindings() -> Vec<KeyBinding> {
 }
 
 pub fn save_key_bindings(bindings: &[KeyBinding]) -> Result<(), String> {
-    let _ = fs::create_dir_all(CONFIG_DIR);
+    let _ = fs::create_dir_all(config_dir());
+    let kf = keymap_file();
     let mut out = String::from(
         "# /etc/asusctl/keymap.conf — Custom ASUS Hardware Keyboard Button Bindings (debian_asusctl)\n\
-         # Supported built-in actions:\n\
-         #   profile-next       : Cycle Power & Fan Profile (Quiet -> Balanced -> Performance -> FullSpeed)\n\
-         #   profile-standard   : Cycle 3 Standard Profiles (Quiet -> Balanced -> Performance)\n\
-         #   swap-monitors      : Move active window between Main Display (eDP-1) and ScreenPad Plus (DP-3)\n\
-         #   screenpad-toggle   : Toggle ASUS ScreenPad Plus secondary display ON/OFF\n\
-         #   screenpad-up       : Increase ScreenPad Plus brightness\n\
-         #   screenpad-down     : Decrease ScreenPad Plus brightness\n\
-         #   kbd-up             : Increase keyboard backlight brightness (0..3)\n\
-         #   kbd-down           : Decrease keyboard backlight brightness (0..3)\n\
-         #   touchpad-toggle    : Toggle internal ELAN touchpad ON/OFF\n\
-         #   mic-mute           : Toggle microphone mute via PulseAudio/PipeWire/ALSA\n\
-         #   screenshot         : Launch area screenshot tool (xfce4-screenshooter -r / flameshot)\n\
-         #   status-notify      : Show desktop OSD notification with Fan RPMs, Profile, TDP & Battery\n\
-         #   exec:<command>     : Execute any custom Linux shell command as the desktop user\n\n",
+         # Built-in actions: profile-next, profile-standard, swap-monitors, screenpad-toggle,\n\
+         # screenpad-up, screenpad-down, kbd-up, kbd-down, touchpad-toggle, mic-mute,\n\
+         # screenshot, camera-notify, status-notify, or exec:<command>\n\n",
     );
     for b in bindings {
+        if !is_valid_action(&b.action) {
+            return Err(format!("Invalid or unsafe action '{}'", b.action));
+        }
         out.push_str(&format!(
             "# {} (Keycodes: {:?}, Scancodes: {:x?})\n",
             b.description, b.keycodes, b.scancodes
         ));
         out.push_str(&format!("{}={}\n\n", b.button_name, b.action));
     }
-    fs::write(KEYMAP_FILE, out).map_err(|e| format!("Failed writing {}: {}", KEYMAP_FILE, e))
+    fs::write(&kf, out).map_err(|e| format!("Failed writing {}: {}", kf.display(), e))
 }
 
 pub fn send_desktop_notification(summary: &str, body: &str, icon: &str) {
-    let icon_clean = icon.replace('\'', "");
-    let sum_clean = summary.replace('\'', "");
-    let body_clean = body.replace('\'', "");
+    if env::var("ASUSCTL_SANDBOX_DIR").is_ok() {
+        return;
+    }
+    let icon_clean = sanitize_text(icon);
+    let sum_clean = sanitize_text(summary);
+    let body_clean = sanitize_text(body);
     let script = format!(
         "if [ \"$(id -u)\" = \"0\" ]; then \
             for uid_dir in /run/user/*; do \
@@ -910,6 +1307,9 @@ pub fn send_desktop_notification(summary: &str, body: &str, icon: &str) {
 }
 
 pub fn run_as_desktop_user(cmd_str: &str) {
+    if env::var("ASUSCTL_SANDBOX_DIR").is_ok() {
+        return;
+    }
     let escaped = cmd_str.replace('"', "\\\"");
     let script = format!(
         "if [ \"$(id -u)\" = \"0\" ]; then \
@@ -932,6 +1332,9 @@ pub fn run_as_desktop_user(cmd_str: &str) {
 
 pub fn execute_button_action(action: &str) -> Result<String, String> {
     let act = action.trim();
+    if !is_valid_action(act) {
+        return Err(format!("Rejected invalid button action '{}'", act));
+    }
     if let Some(custom_cmd) = act.strip_prefix("exec:") {
         run_as_desktop_user(custom_cmd.trim());
         return Ok(format!("Executed custom command: {}", custom_cmd.trim()));
@@ -976,12 +1379,20 @@ pub fn execute_button_action(action: &str) -> Result<String, String> {
         }
         "screenpad-up" => {
             let (_, br) = set_screenpad("up", None)?;
-            send_desktop_notification("ASUS ScreenPad Plus", &format!("Brightness: {}/255", br), "display-brightness");
+            send_desktop_notification(
+                "ASUS ScreenPad Plus",
+                &format!("Brightness: {}/255", br),
+                "display-brightness",
+            );
             Ok(format!("ScreenPad brightness: {}/255", br))
         }
         "screenpad-down" => {
             let (_, br) = set_screenpad("down", None)?;
-            send_desktop_notification("ASUS ScreenPad Plus", &format!("Brightness: {}/255", br), "display-brightness");
+            send_desktop_notification(
+                "ASUS ScreenPad Plus",
+                &format!("Brightness: {}/255", br),
+                "display-brightness",
+            );
             Ok(format!("ScreenPad brightness: {}/255", br))
         }
         "kbd-up" => {
@@ -1003,7 +1414,6 @@ pub fn execute_button_action(action: &str) -> Result<String, String> {
             Ok(format!("Keyboard Backlight: {}/3", lvl))
         }
         "swap-monitors" => {
-            // Dynamically detect eDP-1 and DP-3 coordinates/resolutions (e.g. eDP-1 2560x1440+236+0 and DP-3 3072x880+0+1440)
             let swap_cmd = "if command -v xdotool >/dev/null 2>&1; then \
                 wid=$(xdotool getactivewindow 2>/dev/null); \
                 if [ -n \"$wid\" ]; then \
@@ -1047,7 +1457,11 @@ pub fn execute_button_action(action: &str) -> Result<String, String> {
         "mic-mute" => {
             let mic_cmd = "pactl set-source-mute @DEFAULT_SOURCE@ toggle 2>/dev/null || amixer set Capture toggle 2>/dev/null";
             run_as_desktop_user(mic_cmd);
-            send_desktop_notification("ASUS Audio", "Toggled Microphone Mute", "microphone-sensitivity-muted");
+            send_desktop_notification(
+                "ASUS Audio",
+                "Toggled Microphone Mute",
+                "microphone-sensitivity-muted",
+            );
             Ok("Toggled Microphone Mute".to_string())
         }
         "screenshot" => {
@@ -1074,33 +1488,44 @@ pub fn execute_button_action(action: &str) -> Result<String, String> {
                 prof.as_str(),
                 if fan_str.is_empty() { "Auto".to_string() } else { fan_str },
                 bat,
-                if sp_en { format!("ON ({}/255)", sp_br) } else { "OFF".to_string() }
+                if sp_en {
+                    format!("ON ({}/255)", sp_br)
+                } else {
+                    "OFF".to_string()
+                }
             );
             send_desktop_notification("ASUS System Status", &body, "computer");
             Ok(body)
         }
-        other => {
-            run_as_desktop_user(other);
-            Ok(format!("Executed action: {}", other))
-        }
+        other => Err(format!("Unsupported action '{}'", other)),
     }
 }
 
 pub fn format_status_report() -> String {
-    let vendor = read_trimmed("/sys/class/dmi/id/sys_vendor").unwrap_or_else(|| "ASUSTeK COMPUTER INC.".to_string());
-    let product = read_trimmed("/sys/class/dmi/id/product_name").unwrap_or_else(|| "ASUS Notebook".to_string());
-    let board = read_trimmed("/sys/class/dmi/id/board_name").unwrap_or_else(|| "Unknown".to_string());
-    let bios = read_trimmed("/sys/class/dmi/id/bios_version").unwrap_or_else(|| "Unknown".to_string());
+    let vendor = read_trimmed(sys_path("/sys/class/dmi/id/sys_vendor"))
+        .unwrap_or_else(|| "ASUSTeK COMPUTER INC.".to_string());
+    let product = read_trimmed(sys_path("/sys/class/dmi/id/product_name"))
+        .unwrap_or_else(|| "ASUS Notebook".to_string());
+    let board =
+        read_trimmed(sys_path("/sys/class/dmi/id/board_name")).unwrap_or_else(|| "Unknown".to_string());
+    let bios = read_trimmed(sys_path("/sys/class/dmi/id/bios_version"))
+        .unwrap_or_else(|| "Unknown".to_string());
     let prof = detect_current_profile();
-    let gov = read_trimmed("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor").unwrap_or_else(|| "N/A".to_string());
-    let epp = read_trimmed("/sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference").unwrap_or_else(|| "N/A".to_string());
-    let no_turbo = read_trimmed("/sys/devices/system/cpu/intel_pstate/no_turbo").unwrap_or_else(|| "0".to_string());
-    let max_perf = read_trimmed("/sys/devices/system/cpu/intel_pstate/max_perf_pct").unwrap_or_else(|| "100".to_string());
-    let pl1_w = read_trimmed("/sys/class/powercap/intel-rapl:0/constraint_0_power_limit_uw")
+    let gov = read_trimmed(sys_path("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"))
+        .unwrap_or_else(|| "N/A".to_string());
+    let epp = read_trimmed(sys_path(
+        "/sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference",
+    ))
+    .unwrap_or_else(|| "N/A".to_string());
+    let no_turbo = read_trimmed(sys_path("/sys/devices/system/cpu/intel_pstate/no_turbo"))
+        .unwrap_or_else(|| "0".to_string());
+    let max_perf = read_trimmed(sys_path("/sys/devices/system/cpu/intel_pstate/max_perf_pct"))
+        .unwrap_or_else(|| "100".to_string());
+    let pl1_w = read_trimmed(sys_path("/sys/class/powercap/intel-rapl:0/constraint_0_power_limit_uw"))
         .and_then(|s| s.parse::<u64>().ok())
         .map(|v| format!("{}W", v / 1_000_000))
         .unwrap_or_else(|| "N/A".to_string());
-    let pl2_w = read_trimmed("/sys/class/powercap/intel-rapl:0/constraint_1_power_limit_uw")
+    let pl2_w = read_trimmed(sys_path("/sys/class/powercap/intel-rapl:0/constraint_1_power_limit_uw"))
         .and_then(|s| s.parse::<u64>().ok())
         .map(|v| format!("{}W", v / 1_000_000))
         .unwrap_or_else(|| "N/A".to_string());
@@ -1124,7 +1549,9 @@ pub fn format_status_report() -> String {
     let wmi_ev = find_asus_wmi_input_event()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "not found".to_string());
-    let daemon_up = Path::new(SOCKET_PATH).exists();
+    let sock = socket_path();
+    let daemon_up = sock.exists();
+    let confirmed = is_driver_confirmed();
 
     format!(
         "======================================================================\n\
@@ -1133,6 +1560,7 @@ pub fn format_status_report() -> String {
          System Model       : {} ({})\n\
          Motherboard / BIOS : {} (BIOS {})\n\
          Daemon Socket      : {} ({})\n\
+         Driver Status      : {}\n\
          WMI Hotkey Device  : {}\n\
          ----------------------------------------------------------------------\n\
          [Power & Thermal Performance]\n\
@@ -1155,8 +1583,13 @@ pub fn format_status_report() -> String {
         vendor,
         board,
         bios,
-        SOCKET_PATH,
+        sock.display(),
         if daemon_up { "ONLINE" } else { "DIRECT-SYSFS MODE" },
+        if confirmed {
+            "CONFIRMED (Permanent)"
+        } else {
+            "PENDING USER CONFIRMATION (Run 'asusctl confirm' to keep or 'asusctl revert' to rollback)"
+        },
         wmi_ev,
         prof.as_str(),
         gov,

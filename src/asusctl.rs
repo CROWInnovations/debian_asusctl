@@ -9,9 +9,29 @@ use std::env;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
-use std::path::Path;
+use std::panic;
 use std::process;
 use std::time::Duration;
+
+fn install_crash_revert_hook() {
+    panic::set_hook(Box::new(|panic_info| {
+        eprintln!(
+            "[asusctl] CRITICAL: Driver panic detected ({}). Automatically reverting to previous driver/hardware state...",
+            panic_info
+        );
+        match revert_to_backup_state() {
+            Ok(restored) => {
+                eprintln!(
+                    "[asusctl] Automatic crash rollback completed: {}",
+                    restored.join(", ")
+                );
+            }
+            Err(e) => {
+                eprintln!("[asusctl] Rollback error during crash handler: {}", e);
+            }
+        }
+    }));
+}
 
 fn print_help() {
     println!(
@@ -32,6 +52,9 @@ STANDARD UPSTREAM-COMPATIBLE OPTIONS:
 
 SUBCOMMANDS:
     status | info                  Display complete ASUS hardware, power, fan & peripheral status
+    confirm                        Confirm installation/changes so watchdog does not auto-revert
+    revert | rollback              Revert all hardware & driver settings to previous backup state
+    backup                         Capture a fresh backup snapshot of current system driver state
     profile [ARGS]                 Query or switch ASUS power & thermal performance profiles:
         profile -p | status            Show active profile
         profile -l | list              List available profiles (Quiet, Balanced, Performance, FullSpeed)
@@ -60,11 +83,14 @@ CUSTOM HARDWARE BUTTON NAMES & BUILT-IN ACTIONS:
 
 CONFIGURATION & DAEMON FILES:
     State Config  : /etc/asusctl/asusctl.conf
+    Backup State  : /etc/asusctl/backup_state.conf
     Keymap Config : /etc/asusctl/keymap.conf
     Daemon Socket : /run/asusctl.sock (systemd service: asusctld.service)
 
 EXAMPLES / USAGE REFERENCE:
     asusctl status                                   # Full hardware, profile, fan, ScreenPad & battery status
+    asusctl confirm                                  # Confirm active driver state (cancel auto-revert timer)
+    asusctl revert                                   # Revert to previous system driver/hardware state
     asusctl profile -l                               # List profiles (Quiet, Balanced, Performance, FullSpeed)
     asusctl profile -P Performance                   # Switch to Performance profile
     asusctl profile -n                               # Cycle to the next power profile
@@ -86,10 +112,11 @@ EXAMPLES / USAGE REFERENCE:
 }
 
 fn send_daemon_request(cmd_line: &str) -> Option<Result<String, String>> {
-    if !Path::new(SOCKET_PATH).exists() {
+    let sock = socket_path();
+    if !sock.exists() {
         return None;
     }
-    let stream = UnixStream::connect(SOCKET_PATH).ok()?;
+    let stream = UnixStream::connect(&sock).ok()?;
     let _ = stream.set_read_timeout(Some(Duration::from_secs(4)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(4)));
     let mut writer = stream.try_clone().ok()?;
@@ -225,7 +252,10 @@ fn set_screenpad_cli(action: &str, arg: Option<&str>) -> Result<(), String> {
 
 fn set_fnlock_cli(mode: &str) -> Result<(), String> {
     if let Ok(st) = set_fnlock(mode) {
-        println!("ASUS Fn-Lock set to: {}", if st { "ENABLED (Y)" } else { "DISABLED (N)" });
+        println!(
+            "ASUS Fn-Lock set to: {}",
+            if st { "ENABLED (Y)" } else { "DISABLED (N)" }
+        );
         return Ok(());
     }
     if let Some(res) = send_daemon_request(&format!("FNLOCK {}", mode)) {
@@ -234,7 +264,10 @@ fn set_fnlock_cli(mode: &str) -> Result<(), String> {
         return Ok(());
     }
     let st = set_fnlock(mode)?;
-    println!("ASUS Fn-Lock set to: {}", if st { "ENABLED (Y)" } else { "DISABLED (N)" });
+    println!(
+        "ASUS Fn-Lock set to: {}",
+        if st { "ENABLED (Y)" } else { "DISABLED (N)" }
+    );
     Ok(())
 }
 
@@ -259,7 +292,7 @@ fn print_keys_list() {
         );
     }
     println!("------------------------------------------------------------------------------------------");
-    println!("Config file : {}", KEYMAP_FILE);
+    println!("Config file : {}", keymap_file().display());
     println!("Built-in actions: profile-next, profile-standard, swap-monitors, screenpad-toggle,");
     println!("                  screenpad-up, screenpad-down, kbd-up, kbd-down, touchpad-toggle,");
     println!("                  mic-mute, screenshot, status-notify, or 'exec:<shell command>'");
@@ -337,6 +370,63 @@ fn run() -> Result<(), String> {
             "-s" | "--show-supported" | "status" | "info" => {
                 println!("{}", format_status_report());
                 return Ok(());
+            }
+            "confirm" | "--confirm" => {
+                if let Ok(msg) = confirm_driver_state() {
+                    let _ = send_daemon_request("CONFIRM");
+                    println!("{}", msg);
+                    return Ok(());
+                }
+                if let Some(res) = send_daemon_request("CONFIRM") {
+                    println!("{}", res?);
+                    return Ok(());
+                }
+                let msg = confirm_driver_state()?;
+                println!("{}", msg);
+                return Ok(());
+            }
+            "revert" | "rollback" | "--revert" => {
+                let on_crash = args.get(i + 1).map(|s| s.as_str()) == Some("--on-crash");
+                if !on_crash {
+                    if let Some(res) = send_daemon_request("REVERT") {
+                        println!("{}", res?);
+                        return Ok(());
+                    }
+                }
+                let restored = revert_to_backup_state()?;
+                println!(
+                    "Reverted to previous driver/hardware state ({})",
+                    restored.join(", ")
+                );
+                return Ok(());
+            }
+            "backup" | "--backup" => {
+                if let Ok(bf) = capture_backup_state(true) {
+                    println!(
+                        "Saved current hardware/driver state snapshot to {}",
+                        bf.display()
+                    );
+                    return Ok(());
+                }
+                if let Some(res) = send_daemon_request("BACKUP") {
+                    println!("{}", res?);
+                    return Ok(());
+                }
+                let bf = capture_backup_state(true)?;
+                println!(
+                    "Saved current hardware/driver state snapshot to {}",
+                    bf.display()
+                );
+                return Ok(());
+            }
+            "--simulate-crash" => {
+                if !is_sandbox() {
+                    return Err(
+                        "--simulate-crash is restricted to ASUSCTL_SANDBOX_DIR test environments"
+                            .to_string(),
+                    );
+                }
+                panic!("Simulated driver crash in sandbox environment");
             }
             "-n" | "--next-kbd-bright" => {
                 set_kbd_cli("up")?;
@@ -478,7 +568,10 @@ fn run() -> Result<(), String> {
                 match sub {
                     "status" | "get" => {
                         let st = get_fnlock().unwrap_or(true);
-                        println!("ASUS Fn-Lock: {}", if st { "ENABLED (Y)" } else { "DISABLED (N)" });
+                        println!(
+                            "ASUS Fn-Lock: {}",
+                            if st { "ENABLED (Y)" } else { "DISABLED (N)" }
+                        );
                         return Ok(());
                     }
                     mode => {
@@ -501,7 +594,10 @@ fn run() -> Result<(), String> {
                         }
                         let defs = default_key_bindings();
                         save_key_bindings(&defs)?;
-                        println!("Restored default ASUS button bindings in {}", KEYMAP_FILE);
+                        println!(
+                            "Restored default ASUS button bindings in {}",
+                            keymap_file().display()
+                        );
                         return Ok(());
                     }
                     "bind" | "set" => {
@@ -510,10 +606,19 @@ fn run() -> Result<(), String> {
                         })?;
                         let act_parts = &args[i + 3..];
                         if act_parts.is_empty() {
-                            return Err("Usage: asusctl keys bind <button_name> <action>".to_string());
+                            return Err(
+                                "Usage: asusctl keys bind <button_name> <action>".to_string()
+                            );
                         }
                         let act = act_parts.join(" ");
-                        if let Some(res) = send_daemon_request(&format!("KEYS_BIND {} {}", btn, act))
+                        if !is_valid_action(&act) {
+                            return Err(format!(
+                                "Invalid or unsafe action '{}'. Use a built-in action or 'exec:<command>' without control characters.",
+                                act
+                            ));
+                        }
+                        if let Some(res) =
+                            send_daemon_request(&format!("KEYS_BIND {} {}", btn, act))
                         {
                             println!("{}", res?);
                             return Ok(());
@@ -548,7 +653,10 @@ fn run() -> Result<(), String> {
                                 )
                             })?;
                         if let Ok(out) = execute_button_action(&found.action) {
-                            println!("Triggered '{}' ({}): {}", found.button_name, found.action, out);
+                            println!(
+                                "Triggered '{}' ({}): {}",
+                                found.button_name, found.action, out
+                            );
                             return Ok(());
                         }
                         if let Some(res) = send_daemon_request(&format!("KEYS_TRIGGER {}", btn)) {
@@ -556,7 +664,10 @@ fn run() -> Result<(), String> {
                             return Ok(());
                         }
                         let out = execute_button_action(&found.action)?;
-                        println!("Triggered '{}' ({}): {}", found.button_name, found.action, out);
+                        println!(
+                            "Triggered '{}' ({}): {}",
+                            found.button_name, found.action, out
+                        );
                         return Ok(());
                     }
                     "monitor" | "listen" => {
@@ -584,6 +695,7 @@ fn run() -> Result<(), String> {
 }
 
 fn main() {
+    install_crash_revert_hook();
     if let Err(e) = run() {
         eprintln!("Error: {}", e);
         process::exit(1);

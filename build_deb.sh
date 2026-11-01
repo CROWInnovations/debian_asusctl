@@ -15,6 +15,7 @@ mkdir -p \
     "${PKG_DIR}/usr/bin" \
     "${PKG_DIR}/usr/sbin" \
     "${PKG_DIR}/etc/asusctl" \
+    "${PKG_DIR}/var/lib/asusctl/previous_driver_backup" \
     "${PKG_DIR}/lib/systemd/system" \
     "${PKG_DIR}/lib/udev/rules.d" \
     "${PKG_DIR}/lib/udev/hwdb.d" \
@@ -41,8 +42,9 @@ profile=Balanced
 charge_limit=100
 kbd_brightness=2
 screenpad_enabled=true
-screenpad_brightness=180
+screenpad_brightness=200
 fnlock_enabled=true
+confirmed=true
 EOF
 
 cat > "${PKG_DIR}/etc/asusctl/keymap.conf" << 'EOF'
@@ -102,8 +104,9 @@ Wants=systemd-udev-settle.service
 [Service]
 Type=simple
 ExecStart=/usr/sbin/asusctld
-Restart=always
-RestartSec=2
+ExecStopPost=/bin/sh -c 'if [ "$EXIT_STATUS" != "0" ] && [ -n "$EXIT_STATUS" ]; then /usr/bin/asusctl revert --on-crash; fi'
+Restart=on-failure
+RestartSec=3
 User=root
 Group=root
 StandardOutput=journal
@@ -144,29 +147,13 @@ evdev:name:Asus WMI hotkeys:dmi:bvn*:bvr*:bd*:svnASUSTeK*:pn*:*
  KEYBOARD_KEY_c5=kbdillumdown
 EOF
 
-cat > "${PKG_DIR}/usr/share/doc/debian-asusctl/README.md" << 'EOF'
-# debian_asusctl (v6.2.0-debian2)
+cp -f "${PROJECT_DIR}/README.md" "${PKG_DIR}/usr/share/doc/debian-asusctl/README.md"
 
-Native Debian / Kali GNU/Linux hardware power performance and custom keyboard button controller for ASUS laptops (including ZenBook Pro Duo UX582LR, ZenBook, VivoBook, TUF, and ROG).
-
-## Quick Commands
-- `asusctl status` — Full hardware, power profile, CPU governor/RAPL TDP, fan RPM, keyboard LED, ScreenPad Plus & battery status
-- `asusctl profile -l` — List available power profiles (`Quiet`, `Balanced`, `Performance`, `FullSpeed`)
-- `asusctl profile -P Performance` — Switch to Performance mode (or `Quiet`, `Balanced`, `FullSpeed`)
-- `asusctl profile -n` — Cycle to the next power profile
-- `asusctl fan fullspeed` / `asusctl fan auto` — Toggle maximum fan boost vs automatic thermal fan curve
-- `asusctl -k high` / `asusctl -n` / `asusctl -p` — Control keyboard backlight brightness (`0..3`)
-- `asusctl screenpad toggle` / `asusctl screenpad brightness 200` — Control ASUS ScreenPad Plus secondary display
-- `asusctl -c 80` — Limit battery charge ceiling to 80% for battery longevity
-- `asusctl keys list` — View all 10 custom ASUS hardware keyboard buttons and their actions
-- `asusctl keys bind <button> <action>` — Customize any ASUS hardware button (including `exec:<command>`)
-EOF
-
-echo "[4/5] Writing DEBIAN/control, conffiles, postinst, and prerm maintainer scripts..."
+echo "[4/5] Writing DEBIAN/control, conffiles, preinst, postinst, and prerm maintainer scripts..."
 
 cat > "${PKG_DIR}/DEBIAN/control" << 'EOF'
 Package: debian-asusctl
-Version: 6.2.0-2
+Version: 6.2.0-3
 Section: utils
 Priority: optional
 Architecture: amd64
@@ -177,26 +164,56 @@ Depends: libc6 (>= 2.31), systemd, udev
 Recommends: libnotify-bin, xdotool, wmctrl, xinput, pulseaudio-utils
 Maintainer: Debian ASUS Hardware Team <root@localhost>
 Description: ASUS Power Performance, Fan, ScreenPad & Custom Key Controller for Debian Linux
- Updated, self-contained version of asusctl and asusctld engineered specifically
- for Debian and Kali Linux on ASUS ZenBook Pro Duo (UX582LR), ZenBook, VivoBook,
- TUF, and ROG laptops.
- .
- Features:
-  * Coordinated Power & Thermal Profiles (Quiet, Balanced, Performance, FullSpeed)
-    spanning ASUS ATK cpufv, throttle_thermal_policy, ACPI platform_profile,
-    ASUS hwmon fan PWM boost, Intel P-State Turbo/EPP, and Intel RAPL PL1/PL2 TDPs.
-  * Direct evdev daemon (asusctld) handling all ASUS WMI custom hardware keys,
-    including keycodes > 247 that X11 silently drops (Fan/Performance toggle,
-    Task Swap, ScreenPad Plus toggle 0x6a, MyASUS hub, Mic Mute, Touchpad toggle,
-    and Selective Screenshot).
-  * Full control of Keyboard Backlight (0..3), ScreenPad Plus secondary display
-    (with inverted bl_power=1 ON / bl_power=0 OFF fix & 3840x1100 DP-3 sync),
-    Battery Charge Limit (20..100%), and ASUS Fn-Lock.
+ Self-contained asusctl and asusctld driver for Debian and Kali Linux on ASUS
+ ZenBook Pro Duo (UX582LR), ZenBook, VivoBook, TUF, and ROG laptops.
+ Includes automatic backup, user confirmation watchdog, and crash rollback to the
+ previous system driver/hardware state.
 EOF
 
 cat > "${PKG_DIR}/DEBIAN/conffiles" << 'EOF'
 /etc/asusctl/asusctl.conf
 /etc/asusctl/keymap.conf
+EOF
+
+cat > "${PKG_DIR}/DEBIAN/preinst" << 'EOF'
+#!/bin/sh
+set -e
+
+mkdir -p /etc/asusctl /var/lib/asusctl/previous_driver_backup
+
+# Back up any pre-existing non-debian_asusctl /usr/bin/asusctl binary
+if [ -x /usr/bin/asusctl ] && [ ! -f /var/lib/asusctl/previous_driver_backup/asusctl.orig ]; then
+    if ! /usr/bin/asusctl --version 2>/dev/null | grep -q "debian"; then
+        cp -pf /usr/bin/asusctl /var/lib/asusctl/previous_driver_backup/asusctl.orig 2>/dev/null || true
+    fi
+fi
+
+# Snapshot current kernel/hardware state prior to installing or upgrading driver
+if [ ! -f /etc/asusctl/backup_state.conf ]; then
+    {
+        echo "# /etc/asusctl/backup_state.conf — Pre-install system driver/hardware snapshot"
+        [ -f /sys/devices/platform/asus-nb-wmi/cpufv ] && echo "cpufv=$(cat /sys/devices/platform/asus-nb-wmi/cpufv 2>/dev/null || echo 0)"
+        for pwm in /sys/devices/platform/asus-nb-wmi/hwmon/hwmon*/pwm1_enable; do
+            [ -f "$pwm" ] && echo "pwm1_enable=$(cat "$pwm" 2>/dev/null || echo 2)" && break
+        done
+        [ -f /sys/devices/system/cpu/intel_pstate/no_turbo ] && echo "no_turbo=$(cat /sys/devices/system/cpu/intel_pstate/no_turbo 2>/dev/null || echo 0)"
+        [ -f /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor ] && echo "governor=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo powersave)"
+        [ -f /sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference ] && echo "epp=$(cat /sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference 2>/dev/null || echo balance_performance)"
+        [ -f /sys/class/powercap/intel-rapl:0/constraint_0_power_limit_uw ] && echo "pl1_uw=$(cat /sys/class/powercap/intel-rapl:0/constraint_0_power_limit_uw 2>/dev/null || echo 45000000)"
+        [ -f /sys/class/powercap/intel-rapl:0/constraint_1_power_limit_uw ] && echo "pl2_uw=$(cat /sys/class/powercap/intel-rapl:0/constraint_1_power_limit_uw 2>/dev/null || echo 70000000)"
+        [ -f /sys/class/leds/asus::kbd_backlight/brightness ] && echo "kbd_brightness=$(cat /sys/class/leds/asus::kbd_backlight/brightness 2>/dev/null || echo 2)"
+        [ -f /sys/class/backlight/asus_screenpad/bl_power ] && echo "screenpad_bl_power=$(cat /sys/class/backlight/asus_screenpad/bl_power 2>/dev/null || echo 1)"
+        [ -f /sys/class/backlight/asus_screenpad/brightness ] && echo "screenpad_brightness=$(cat /sys/class/backlight/asus_screenpad/brightness 2>/dev/null || echo 200)"
+        [ -f /sys/class/backlight/intel_backlight/brightness ] && echo "intel_backlight_brightness=$(cat /sys/class/backlight/intel_backlight/brightness 2>/dev/null || echo 264)"
+        for bat in /sys/class/power_supply/BAT*/charge_control_end_threshold; do
+            [ -f "$bat" ] && echo "charge_limit=$(cat "$bat" 2>/dev/null || echo 100)" && break
+        done
+        [ -f /sys/module/asus_wmi/parameters/fnlock_default ] && echo "fnlock=$(cat /sys/module/asus_wmi/parameters/fnlock_default 2>/dev/null || echo Y)"
+    } > /etc/asusctl/backup_state.conf
+    chmod 0644 /etc/asusctl/backup_state.conf
+fi
+
+exit 0
 EOF
 
 cat > "${PKG_DIR}/DEBIAN/postinst" << 'EOF'
@@ -234,11 +251,42 @@ if [ "$1" = "configure" ]; then
                /sys/devices/platform/asus-nb-wmi/hwmon/hwmon*/pwm1_enable \
                /sys/module/asus_wmi/parameters/fnlock_default 2>/dev/null || true
 
+    chgrp sudo /etc/asusctl /etc/asusctl/asusctl.conf /etc/asusctl/backup_state.conf 2>/dev/null || true
+    chmod 0775 /etc/asusctl 2>/dev/null || true
+    chmod 0664 /etc/asusctl/asusctl.conf /etc/asusctl/backup_state.conf 2>/dev/null || true
+    chmod 0644 /etc/asusctl/keymap.conf 2>/dev/null || true
+    chown root:root /etc/asusctl/keymap.conf 2>/dev/null || true
+
+    # Arm confirmation watchdog unless already confirmed or ASUSCTL_AUTO_CONFIRM=1
+    if [ "${ASUSCTL_AUTO_CONFIRM:-0}" = "1" ]; then
+        /usr/bin/asusctl confirm >/dev/null 2>&1 || true
+    elif [ "${ASUSCTL_REQUIRE_CONFIRM:-0}" = "1" ] || ! grep -q "^confirmed=true" /etc/asusctl/asusctl.conf 2>/dev/null; then
+        echo "pending" > /run/asusctl.pending_confirm 2>/dev/null || true
+    fi
+
     # Enable and start asusctld systemd service
     if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
         systemctl daemon-reload >/dev/null 2>&1 || true
         systemctl enable asusctld.service >/dev/null 2>&1 || true
         systemctl restart asusctld.service >/dev/null 2>&1 || true
+    fi
+
+    # Interactive confirmation prompt when a terminal is attached and confirmation is pending
+    if [ -f /run/asusctl.pending_confirm ] && [ -t 0 ]; then
+        printf "\n[debian_asusctl] Confirm driver installation and display/power state? [Y/n] (auto-reverts in 90s if unconfirmed): "
+        if read -r -t 30 ans; then
+            case "$ans" in
+                [nN]*)
+                    echo "[debian_asusctl] Reverting to previous system driver/hardware state..."
+                    /usr/bin/asusctl revert || true
+                    ;;
+                *)
+                    /usr/bin/asusctl confirm || true
+                    ;;
+            esac
+        else
+            echo "\n[debian_asusctl] No input received yet. Run 'sudo asusctl confirm' within 90s to keep changes, or it will auto-revert."
+        fi
     fi
 fi
 
@@ -254,17 +302,18 @@ if [ "$1" = "remove" ] || [ "$1" = "purge" ]; then
         systemctl stop asusctld.service >/dev/null 2>&1 || true
         systemctl disable asusctld.service >/dev/null 2>&1 || true
     fi
-    rm -f /run/asusctl.sock
+    /usr/bin/asusctl revert >/dev/null 2>&1 || true
+    rm -f /run/asusctl.sock /run/asusctl.pending_confirm
 fi
 
 exit 0
 EOF
 
-chmod 0755 "${PKG_DIR}/DEBIAN/postinst" "${PKG_DIR}/DEBIAN/prerm"
+chmod 0755 "${PKG_DIR}/DEBIAN/preinst" "${PKG_DIR}/DEBIAN/postinst" "${PKG_DIR}/DEBIAN/prerm"
 chmod 0644 "${PKG_DIR}/DEBIAN/control" "${PKG_DIR}/DEBIAN/conffiles"
 
 echo "[5/5] Building standard Debian install package (.deb)..."
-DEB_VERSIONED="${PROJECT_DIR}/debian_asusctl_6.2.0-2_amd64.deb"
+DEB_VERSIONED="${PROJECT_DIR}/debian_asusctl_6.2.0-3_amd64.deb"
 DEB_STANDARD="${PROJECT_DIR}/debian_asusctl.deb"
 DEB_WORKSPACE="/home/bob/Projects/debian_asusctl.deb"
 
