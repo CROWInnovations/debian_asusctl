@@ -1,6 +1,8 @@
 # debian_asusctl
 
-Native Debian / Kali Linux power performance, fan, ScreenPad Plus, and custom hardware key driver for ASUS laptops (`v6.2.0-3`).
+Native Debian / Kali Linux driver for ASUS laptops (`v6.2.0-3`).
+
+Includes full integration into the Debian OS for power performance, fan, ScreenPad Plus, and custom hardware setting changes with safety rollback built in.
 
 ## Install & Confirm
 
