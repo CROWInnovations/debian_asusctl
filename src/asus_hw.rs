@@ -920,14 +920,9 @@ pub fn sync_screenpad_xrandr(enable: bool) {
         "sleep 1.2; \
          if ! xrandr --listmonitors 2>/dev/null | grep -q 'DP-3'; then \
              edp_geom=$(xrandr --listmonitors 2>/dev/null | awk '/eDP-1/{print $3}'); \
-             edp_w=$(echo \"$edp_geom\" | awk -F'[x/+]' '{print $1}'); \
              edp_h=$(echo \"$edp_geom\" | awk -F'[x/+]' '{print $3}'); \
              edp_h=${edp_h:-1440}; \
-             if [ \"${edp_w:-2560}\" -lt 3840 ]; then \
-                 xrandr --output DP-3 --mode 3840x1100 --scale 0.8x0.8 --pos 0x${edp_h} 2>/dev/null || xrandr --output DP-3 --auto --below eDP-1 2>/dev/null; \
-             else \
-                 xrandr --output DP-3 --mode 3840x1100 --scale 1x1 --pos 0x${edp_h} 2>/dev/null || xrandr --output DP-3 --auto --below eDP-1 2>/dev/null; \
-             fi; \
+             xrandr --output DP-3 --mode 3840x1100 --scale 1x1 --pos 0x${edp_h} 2>/dev/null || xrandr --output DP-3 --auto --below eDP-1 --scale 1x1 2>/dev/null; \
          fi"
     } else {
         "sleep 0.3; \
