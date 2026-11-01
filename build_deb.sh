@@ -15,6 +15,7 @@ mkdir -p \
     "${PKG_DIR}/usr/bin" \
     "${PKG_DIR}/usr/sbin" \
     "${PKG_DIR}/etc/asusctl" \
+    "${PKG_DIR}/etc/xdg/autostart" \
     "${PKG_DIR}/var/lib/asusctl/previous_driver_backup" \
     "${PKG_DIR}/lib/systemd/system" \
     "${PKG_DIR}/lib/udev/rules.d" \
@@ -148,6 +149,17 @@ evdev:name:Asus WMI hotkeys:dmi:bvn*:bvr*:bd*:svnASUSTeK*:pn*:*
 EOF
 
 cp -f "${PROJECT_DIR}/README.md" "${PKG_DIR}/usr/share/doc/debian-asusctl/README.md"
+
+cat > "${PKG_DIR}/etc/xdg/autostart/debian-asusctl-cursor-guard.desktop" << 'EOF'
+[Desktop Entry]
+Type=Application
+Name=ASUS ScreenPad Hardware Cursor Guard
+Comment=Ensure DP-3 uses 1x1 scale so Intel GPU Hardware Cursor remains active without flicker
+Exec=/bin/sh -c "sleep 2; if xrandr --listmonitors 2>/dev/null | grep -q 'DP-3'; then edp_h=$(xrandr --listmonitors 2>/dev/null | awk '/eDP-1/{print $3}' | awk -F'[x/+]' '{print $3}'); edp_h=${edp_h:-1440}; xrandr --output DP-3 --mode 3840x1100 --pos 0x${edp_h} --scale 1x1 2>/dev/null || true; fi"
+Hidden=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
+EOF
 
 echo "[4/5] Writing DEBIAN/control, conffiles, preinst, postinst, and prerm maintainer scripts..."
 
